@@ -45,6 +45,8 @@ static std::string RecordTypeToString(int record_type) {
       {PERF_RECORD_BUILD_ID, "build_id"},
       {PERF_RECORD_MMAP2, "mmap2"},
       {PERF_RECORD_AUX, "aux"},
+      {PERF_RECORD_SWITCH, "switch"},
+      {PERF_RECORD_SWITCH_CPU_WIDE, "switch_cpu_wide"},
       {PERF_RECORD_TRACING_DATA, "tracing_data"},
       {PERF_RECORD_AUXTRACE_INFO, "auxtrace_info"},
       {PERF_RECORD_AUXTRACE, "auxtrace"},
@@ -186,7 +188,7 @@ Record::Record(Record&& other) noexcept {
 }
 
 void Record::Dump(size_t indent) const {
-  PrintIndented(indent, "record %s: type %u, misc %u, size %u\n",
+  PrintIndented(indent, "record %s: type %u, misc 0x%x, size %u\n",
                 RecordTypeToString(type()).c_str(), type(), misc(), size());
   DumpData(indent + 1);
   sample_id.Dump(indent + 1);
@@ -884,6 +886,27 @@ void AuxRecord::DumpData(size_t indent) const {
   PrintIndented(indent, "flags 0x%" PRIx64 "\n", data->flags);
 }
 
+SwitchRecord::SwitchRecord(const perf_event_attr& attr, char* p) : Record(p) {
+  const char* end = p + size();
+  p += header_size();
+  sample_id.ReadFromBinaryFormat(attr, p, end);
+}
+
+SwitchCpuWideRecord::SwitchCpuWideRecord(const perf_event_attr& attr, char* p) : Record(p) {
+  const char* end = p + size();
+  p += header_size();
+  MoveFromBinaryFormat(tid_data, p);
+  sample_id.ReadFromBinaryFormat(attr, p, end);
+}
+
+void SwitchCpuWideRecord::DumpData(size_t indent) const {
+  if (header.misc & PERF_RECORD_MISC_SWITCH_OUT) {
+    PrintIndented(indent, "next_pid %u, next_tid %u\n", tid_data.pid, tid_data.tid);
+  } else {
+    PrintIndented(indent, "prev_pid %u, prev_tid %u\n", tid_data.pid, tid_data.tid);
+  }
+}
+
 BuildIdRecord::BuildIdRecord(char* p) : Record(p) {
   const char* end = p + size();
   p += header_size();
@@ -924,25 +947,42 @@ AuxTraceInfoRecord::AuxTraceInfoRecord(char* p) : Record(p) {
   p += header_size();
   data = reinterpret_cast<DataType*>(p);
   CHECK_EQ(data->aux_type, AUX_TYPE_ETM);
-  CHECK_EQ(data->version, 0);
+  CHECK_EQ(data->version, 1);
+  p += sizeof(DataType);
   for (uint32_t i = 0; i < data->nr_cpu; ++i) {
-    CHECK_EQ(data->etm4_info[i].magic, MAGIC_ETM4);
+    uint64_t magic = *reinterpret_cast<uint64_t*>(p);
+    if (magic == MAGIC_ETM4) {
+      p += sizeof(ETM4Info);
+    } else {
+      CHECK_EQ(magic, MAGIC_ETE);
+      p += sizeof(ETEInfo);
+    }
   }
-  p += sizeof(DataType) + data->nr_cpu * sizeof(ETM4Info);
   CHECK_EQ(p, end);
 }
 
-AuxTraceInfoRecord::AuxTraceInfoRecord(const DataType& data,
-                                       const std::vector<ETM4Info>& etm4_info) {
+AuxTraceInfoRecord::AuxTraceInfoRecord(const DataType& data, const std::vector<ETEInfo>& ete_info) {
   SetTypeAndMisc(PERF_RECORD_AUXTRACE_INFO, 0);
-  SetSize(header_size() + sizeof(DataType) + sizeof(ETM4Info) * etm4_info.size());
-  char* new_binary = new char[size()];
+
+  uint32_t size = header_size() + sizeof(DataType);
+  for (auto& ete : ete_info) {
+    size += (ete.trcdevarch == 0) ? sizeof(ETM4Info) : sizeof(ETEInfo);
+  }
+  SetSize(size);
+  char* new_binary = new char[size];
   char* p = new_binary;
   MoveToBinaryFormat(header, p);
   this->data = reinterpret_cast<DataType*>(p);
   MoveToBinaryFormat(data, p);
-  for (auto& etm4 : etm4_info) {
-    MoveToBinaryFormat(etm4, p);
+  for (auto& ete : ete_info) {
+    if (ete.trcdevarch == 0) {
+      ETM4Info etm4;
+      static_assert(sizeof(ETM4Info) + sizeof(uint64_t) == sizeof(ETEInfo));
+      memcpy(&etm4, &ete, sizeof(ETM4Info));
+      MoveToBinaryFormat(etm4, p);
+    } else {
+      MoveToBinaryFormat(ete, p);
+    }
   }
   UpdateBinary(new_binary);
 }
@@ -954,17 +994,38 @@ void AuxTraceInfoRecord::DumpData(size_t indent) const {
   PrintIndented(indent, "pmu_type %u\n", data->pmu_type);
   PrintIndented(indent, "snapshot %" PRIu64 "\n", data->snapshot);
   indent++;
+  uint64_t* info = data->info;
+
   for (int i = 0; i < data->nr_cpu; i++) {
-    const ETM4Info& e = data->etm4_info[i];
-    PrintIndented(indent, "magic 0x%" PRIx64 "\n", e.magic);
-    PrintIndented(indent, "cpu %" PRIu64 "\n", e.cpu);
-    PrintIndented(indent, "trcconfigr 0x%" PRIx64 "\n", e.trcconfigr);
-    PrintIndented(indent, "trctraceidr 0x%" PRIx64 "\n", e.trctraceidr);
-    PrintIndented(indent, "trcidr0 0x%" PRIx64 "\n", e.trcidr0);
-    PrintIndented(indent, "trcidr1 0x%" PRIx64 "\n", e.trcidr1);
-    PrintIndented(indent, "trcidr2 0x%" PRIx64 "\n", e.trcidr2);
-    PrintIndented(indent, "trcidr8 0x%" PRIx64 "\n", e.trcidr8);
-    PrintIndented(indent, "trcauthstatus 0x%" PRIx64 "\n", e.trcauthstatus);
+    if (info[0] == MAGIC_ETM4) {
+      ETM4Info& e = *reinterpret_cast<ETM4Info*>(info);
+      PrintIndented(indent, "magic 0x%" PRIx64 "\n", e.magic);
+      PrintIndented(indent, "cpu %" PRIu64 "\n", e.cpu);
+      PrintIndented(indent, "nrtrcparams %" PRIu64 "\n", e.nrtrcparams);
+      PrintIndented(indent, "trcconfigr 0x%" PRIx64 "\n", e.trcconfigr);
+      PrintIndented(indent, "trctraceidr 0x%" PRIx64 "\n", e.trctraceidr);
+      PrintIndented(indent, "trcidr0 0x%" PRIx64 "\n", e.trcidr0);
+      PrintIndented(indent, "trcidr1 0x%" PRIx64 "\n", e.trcidr1);
+      PrintIndented(indent, "trcidr2 0x%" PRIx64 "\n", e.trcidr2);
+      PrintIndented(indent, "trcidr8 0x%" PRIx64 "\n", e.trcidr8);
+      PrintIndented(indent, "trcauthstatus 0x%" PRIx64 "\n", e.trcauthstatus);
+      info = reinterpret_cast<uint64_t*>(&e + 1);
+    } else {
+      CHECK_EQ(info[0], MAGIC_ETE);
+      ETEInfo& e = *reinterpret_cast<ETEInfo*>(info);
+      PrintIndented(indent, "magic 0x%" PRIx64 "\n", e.magic);
+      PrintIndented(indent, "cpu %" PRIu64 "\n", e.cpu);
+      PrintIndented(indent, "nrtrcparams %" PRIu64 "\n", e.nrtrcparams);
+      PrintIndented(indent, "trcconfigr 0x%" PRIx64 "\n", e.trcconfigr);
+      PrintIndented(indent, "trctraceidr 0x%" PRIx64 "\n", e.trctraceidr);
+      PrintIndented(indent, "trcidr0 0x%" PRIx64 "\n", e.trcidr0);
+      PrintIndented(indent, "trcidr1 0x%" PRIx64 "\n", e.trcidr1);
+      PrintIndented(indent, "trcidr2 0x%" PRIx64 "\n", e.trcidr2);
+      PrintIndented(indent, "trcidr8 0x%" PRIx64 "\n", e.trcidr8);
+      PrintIndented(indent, "trcauthstatus 0x%" PRIx64 "\n", e.trcauthstatus);
+      PrintIndented(indent, "trcdevarch 0x%" PRIx64 "\n", e.trcdevarch);
+      info = reinterpret_cast<uint64_t*>(&e + 1);
+    }
   }
 }
 
@@ -1371,6 +1432,10 @@ std::unique_ptr<Record> ReadRecordFromBuffer(const perf_event_attr& attr, uint32
       return std::unique_ptr<Record>(new SampleRecord(attr, p));
     case PERF_RECORD_AUX:
       return std::unique_ptr<Record>(new AuxRecord(attr, p));
+    case PERF_RECORD_SWITCH:
+      return std::unique_ptr<Record>(new SwitchRecord(attr, p));
+    case PERF_RECORD_SWITCH_CPU_WIDE:
+      return std::unique_ptr<Record>(new SwitchCpuWideRecord(attr, p));
     case PERF_RECORD_TRACING_DATA:
       return std::unique_ptr<Record>(new TracingDataRecord(p));
     case PERF_RECORD_AUXTRACE_INFO:
