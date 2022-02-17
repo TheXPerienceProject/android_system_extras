@@ -539,7 +539,7 @@ TEST(record_cmd, trace_offcpu_option) {
   TEST_REQUIRE_TRACEPOINT_EVENTS();
   OMIT_TEST_ON_NON_NATIVE_ABIS();
   TemporaryFile tmpfile;
-  ASSERT_TRUE(RunRecordCmd({"--trace-offcpu", "-f", "1000"}, tmpfile.path));
+  ASSERT_TRUE(RunRecordCmd({"--trace-offcpu", "-e", "cpu-clock", "-f", "1000"}, tmpfile.path));
   CheckEventType(tmpfile.path, "sched:sched_switch", 1u, 0u);
   std::unique_ptr<RecordFileReader> reader = RecordFileReader::CreateInstance(tmpfile.path);
   ASSERT_TRUE(reader);
@@ -551,9 +551,7 @@ TEST(record_cmd, trace_offcpu_option) {
   // Release recording environment in perf.data, to avoid affecting tests below.
   reader.reset();
 
-  // --trace-offcpu only works with cpu-clock, task-clock and cpu-cycles. cpu-cycles has been
-  // tested above.
-  ASSERT_TRUE(RunRecordCmd({"--trace-offcpu", "-e", "cpu-clock"}));
+  // --trace-offcpu only works with cpu-clock and task-clock. cpu-clock has been tested above.
   ASSERT_TRUE(RunRecordCmd({"--trace-offcpu", "-e", "task-clock"}));
   ASSERT_FALSE(RunRecordCmd({"--trace-offcpu", "-e", "page-faults"}));
   // --trace-offcpu doesn't work with more than one event.
@@ -562,6 +560,16 @@ TEST(record_cmd, trace_offcpu_option) {
 
 TEST(record_cmd, exit_with_parent_option) {
   ASSERT_TRUE(RunRecordCmd({"--exit-with-parent"}));
+}
+
+TEST(record_cmd, use_cmd_exit_code_option) {
+  TemporaryFile tmpfile;
+  int exit_code;
+  RecordCmd()->Run({"--use-cmd-exit-code", "-o", tmpfile.path, "ls", "."}, &exit_code);
+  ASSERT_EQ(exit_code, 0);
+  RecordCmd()->Run({"--use-cmd-exit-code", "-o", tmpfile.path, "ls", "/not_exist_path"},
+                   &exit_code);
+  ASSERT_NE(exit_code, 0);
 }
 
 TEST(record_cmd, clockid_option) {
@@ -1199,4 +1207,25 @@ TEST(record_cmd, device_meta_info) {
   it = meta_info.find("android_build_type");
   ASSERT_NE(it, meta_info.end());
   ASSERT_FALSE(it->second.empty());
+}
+
+TEST(record_cmd, add_counter_option) {
+  TEST_REQUIRE_HW_COUNTER();
+  TemporaryFile tmpfile;
+  ASSERT_TRUE(RecordCmd()->Run({"-e", "cpu-cycles", "--add-counter", "instructions", "--no-inherit",
+                                "-o", tmpfile.path, "sleep", "1"}));
+  std::unique_ptr<RecordFileReader> reader = RecordFileReader::CreateInstance(tmpfile.path);
+  ASSERT_TRUE(reader);
+  bool has_sample = false;
+  ASSERT_TRUE(reader->ReadDataSection([&](std::unique_ptr<Record> r) {
+    if (r->type() == PERF_RECORD_SAMPLE) {
+      has_sample = true;
+      auto sr = static_cast<SampleRecord*>(r.get());
+      if (sr->read_data.counts.size() != 2 || sr->read_data.ids.size() != 2) {
+        return false;
+      }
+    }
+    return true;
+  }));
+  ASSERT_TRUE(has_sample);
 }
